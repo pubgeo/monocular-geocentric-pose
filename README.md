@@ -2,7 +2,7 @@
 
 ## References
 
-If you use our dataset or code, please cite our paper:
+If you use our dataset or code, please cite [our paper](http://openaccess.thecvf.com/content_CVPR_2020/papers/Christie_Learning_Geocentric_Object_Pose_in_Oblique_Monocular_Images_CVPR_2020_paper.pdf):
 
 ```
 @inproceedings{christie2020geocentricpose,
