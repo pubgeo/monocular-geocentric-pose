@@ -69,7 +69,7 @@ def test(args):
         nums = [np.int(path.split(".")[-2]) for path in weights_paths]
         weights_path = weights_paths[np.argsort(nums)[-1]]
         
-    model = load_model(weights_path, custom_objects={"no_nan_mse":no_nan_mse})
+    model = load_model(weights_path, compile=False)
     
     predictions_dir = args.predictions_dir if sub_dir is None else os.path.join(args.predictions_dir, sub_dir)
     if not os.path.isdir(predictions_dir):
