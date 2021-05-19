@@ -1,59 +1,114 @@
-"""
-Copyright 2020 The Johns Hopkins University Applied Physics Laboratory LLC
-All rights reserved.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
-#Approved for public release, 20-563
-
 import argparse
 import os
-from utilities.ml_utils import train,test,metrics
+import numpy as np
+from utilities.ml_utils import train, test
 
-if __name__=="__main__": 
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--augmentation", action="store_true", help="train with rotations (modifies ground truth orientation)")
-    parser.add_argument("--test-rotations", action="store_true", help="apply test-time rotations (more test instances)")
-    parser.add_argument("--add-height", action="store_true", help="train with height regression")
-    parser.add_argument("--train", action="store_true", help="train")
+    parser.add_argument(
+        "--augmentation", action="store_true", help="whether or not to use augmentation"
+    )
+    parser.add_argument("--train", action="store_true", help="train model")
     parser.add_argument("--test", action="store_true", help="generate test predictions")
-    parser.add_argument("--metrics", action="store_true", help="evaluate predictions against ground truth")
-    parser.add_argument("--multiprocessing", action="store_true", help="use multiprocessing for metrics")
-    parser.add_argument("--gpus", type=str, help="gpu indices (comma separated)", default='0')
-    parser.add_argument("--num-epochs", type=int, help="gpu indices (comma separated)", default=100)
-    parser.add_argument("--save-period", type=int, help="gpu indices (comma separated)", default=5)
-    parser.add_argument("--batch-size", type=int, help="batch size", default=2)
-    parser.add_argument("--continue-training-file", type=str, help="file to continue training from", default=None)
-    parser.add_argument("--test-model-file", type=str, help="test checkpoint if not running default selection", default=None)
-    parser.add_argument("--checkpoint-dir", type=str, help="where to store and load checkpoints from", default="./checkpoints")
-    parser.add_argument("--tensorboard-dir", type=str, help="tensorboard log directory",  default="./tensorboard")
-    parser.add_argument("--predictions-dir", type=str, help="where to store predictions", default="./predictions")
-    parser.add_argument("--dataset-dir", type=str, help="dataset directory", default="./dataset")
-    parser.add_argument("--train-sub-dir", type=str, help="train folder within datset-dir", default="train")
-    parser.add_argument("--test-sub-dir", type=str, help="test folder within datset-dir", default="test")
-    parser.add_argument("--image-size", type=int, nargs="+", help="image size", default=(2048,2048))
-    parser.add_argument("--backbone", type=str, help="unet backbone", default="resnet34")
+    parser.add_argument("--gpus", type=str, default="0")
+    parser.add_argument(
+        "--num-workers", type=int, help="number of data loader workers", default=1
+    )
+    parser.add_argument(
+        "--num-epochs", type=int, help="number of epochs to train", default=200
+    )
+    parser.add_argument(
+        "--save-period",
+        type=int,
+        help="epoch frequency to save model checkpoints",
+        default=2,
+    )
+    parser.add_argument("--save-best", action="store_true", help="save best weights")
+    parser.add_argument(
+        "--val-period",
+        type=int,
+        help="epoch frequency for running validation (zero if none)",
+        default=0,
+    )
+    parser.add_argument("--batch-size", type=int, help="batch size", default=4)
+    parser.add_argument(
+        "--downsample",
+        type=int,
+        help="factor for downsampling image at test time",
+        default=1,
+    )
+    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints")
+    parser.add_argument("--predictions-dir", type=str, default="./predictions")
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        help="Default is most recent in checkpoint dir",
+        default=None,
+    )
+    parser.add_argument(
+        "--dataset-dir", type=str, help="dataset directory", default="./dataset"
+    )
+    parser.add_argument(
+        "--train-sub-dir",
+        type=str,
+        help="train folder within datset-dir",
+        default="train",
+    )
+    parser.add_argument(
+        "--test-sub-dir", type=str, help="test folder within datset-dir", default="test"
+    )
+    parser.add_argument(
+        "--valid-sub-dir",
+        type=str,
+        help="validation folder within datset-dir",
+        default="valid",
+    )
+    parser.add_argument("--backbone", type=str, default="resnet34")
+    parser.add_argument("--learning-rate", type=float, default=0.0001)
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        help="number of images to randomly sample for training",
+        default=None,
+    )
+    parser.add_argument("--agl-weight", type=float, help="agl loss weight", default=1)
+    parser.add_argument("--mag-weight", type=float, help="mag loss weight", default=2)
+    parser.add_argument(
+        "--angle-weight", type=float, help="angle loss weight", default=10
+    )
+    parser.add_argument(
+        "--scale-weight", type=float, help="scale loss weight", default=10
+    )
+    parser.add_argument(
+        "--rgb-suffix", type=str, help="suffix for rgb files", default="j2k"
+    )
+    parser.add_argument(
+        "--nan-placeholder",
+        type=int,
+        help="placeholder value for nans. use 0 for no placeholder",
+        default=65535,
+    )
+    parser.add_argument(
+        "--unit",
+        type=str,
+        help="unit of AGLS (m, cm) -- converted inputs are in cm, downsampled data is in m",
+        default="cm",
+    )
+    parser.add_argument(
+        "--convert-predictions-to-cm-and-compress",
+        type=bool,
+        help="Whether to process predictions by converting to cm and compressing",
+        default=True,
+    )
+
     args = parser.parse_args()
-    
+
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
-    
+
     if args.train:
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
         train(args)
-        
+
     if args.test:
+        os.makedirs(args.predictions_dir, exist_ok=True)
         test(args)
-        
-    if args.metrics:
-        metrics(args)
-    

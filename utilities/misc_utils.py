@@ -1,114 +1,163 @@
-"""
-Copyright 2020 The Johns Hopkins University Applied Physics Laboratory LLC
-All rights reserved.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
-#Approved for public release, 20-563
-
-import sys
-sys.path.append("..")
-
-from glob import glob
-import os
+from pathlib import Path
+from osgeo import gdal
 import numpy as np
-import gdal
 import json
-from keras import backend as K
-from keras.applications import imagenet_utils
-
-def no_nan_mse(y_true, y_pred, ignore_value=-10000):
-    mask_true = K.cast(K.not_equal(y_true, ignore_value), K.floatx())
-    masked_squared_error = K.square(mask_true * (y_true - y_pred))
-    masked_mse = K.sum(masked_squared_error, axis=-1) / K.maximum(K.sum(mask_true, axis=-1), 1)
-    return masked_mse
-
-def get_checkpoint_dir(args):
-    height_str = "with_height" if args.add_height else "without_height"
-    aug_str = "with_aug" if args.augmentation else "without_aug"
-    checkpoint_sub_dir = height_str + "_" + aug_str
-    
-    checkpoint_dir = os.path.join(args.checkpoint_dir, checkpoint_sub_dir)
-    if not os.path.isdir(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
-        
-    return checkpoint_dir,checkpoint_sub_dir
+import os
+from tqdm import tqdm
+from PIL import Image
 
 
-def load_vflow(vflow_path, agl):
-    
-    vflow_data = json.load(open(vflow_path, "r"))
-    
-    mag = agl * vflow_data["scale"]
-    
-    xdir,ydir = np.sin(vflow_data["angle"]),np.cos(vflow_data["angle"])
-
-    vflow = np.zeros((agl.shape[0],agl.shape[1],2))
-    vflow[:,:,0] = mag * xdir
-    vflow[:,:,1] = mag * ydir
-    
-    vflow_info = json.load(open(vflow_path, "r"))
-    
-    return vflow,mag,xdir,ydir,vflow_data["angle"]
+UNITS_PER_METER_CONVERSION_FACTORS = {"cm": 100.0, "m": 1.0}
 
 
-def get_data(args, is_train=True, rgb_paths_only=False):
-    split_dir = args.train_sub_dir if is_train else args.test_sub_dir
-    rgb_paths = glob(os.path.join(args.dataset_dir, split_dir, "*_RGB*.tif"))
-    if rgb_paths_only:
-        return rgb_paths
-    vflow_paths = [rgb_path.replace("_RGB", "_VFLOW").replace(".tif", ".json") for rgb_path in rgb_paths]
-    agl_paths = [rgb_path.replace("_RGB", "_AGL") for rgb_path in rgb_paths]
-    data = [(rgb_paths[i], vflow_paths[i], agl_paths[i]) for i in range(len(rgb_paths))]
-    return data
-    
-def load_image(image_path):
-    image = gdal.Open(image_path)
+def save_image(img_path, img):
+    """Note this function does not utilize conversion factors to meters, so implicitly assumes units are in meters."""
+    rows = img.shape[0]
+    cols = img.shape[1]
+    bands = 1
+    if np.ndim(img) == 3:
+        bands = img.shape[2]
+    if img.dtype == np.uint8:
+        data_type = gdal.GDT_Byte
+    else:
+        data_type = gdal.GDT_Float32
+    driver = gdal.GetDriverByName("GTiff").Create(
+        str(img_path), rows, cols, bands, data_type, ["COMPRESS=LZW"]
+    )
+    if bands == 1:
+        driver.GetRasterBand(1).WriteArray(img[:, :])
+    else:
+        for i in range(bands):
+            driver.GetRasterBand(i + 1).WriteArray(img[:, :, i])
+    driver.FlushCache()
+    driver = None
+
+
+def load_image(
+    image_path,
+    args,
+    dtype_out="float32",
+    units_per_meter_conversion_factors=UNITS_PER_METER_CONVERSION_FACTORS,
+):
+
+    image_path = Path(image_path)
+    if not image_path.exists():
+        return None
+    image = gdal.Open(str(image_path))
     image = image.ReadAsArray()
-    if len(image.shape)==3:
-        image = np.transpose(image, [1,2,0])
+
+    # convert AGL units and fill nan placeholder with nan
+    if "AGL" in image_path.name:
+        image = image.astype(dtype_out)
+        np.putmask(image, image == args.nan_placeholder, np.nan)
+        # e.g., (cm) / (cm / m) = m
+        units_per_meter = units_per_meter_conversion_factors[args.unit]
+        image = (image / units_per_meter).astype(dtype_out)
+
+    # transpose if RGB
+    if len(image.shape) == 3:
+        image = np.transpose(image, [1, 2, 0])
+
     return image
 
-def save_image(image, out_path):
-    driver = gdal.GetDriverByName('GTiff')
-    if len(image.shape)==2:
-        out_channels = 1
-    else:
-        out_channels = image.shape[2]
-    dataset = driver.Create(out_path, image.shape[1], image.shape[0], out_channels, gdal.GDT_Float32)
-    if len(image.shape)==2:
-        dataset.GetRasterBand(1).WriteArray(image)
-    else:
-        for c in range(out_channels):
-            dataset.GetRasterBand(c+1).WriteArray(image[:,:,c])
-            
-    dataset.FlushCache()
 
-def image_preprocess(image_batch):
-    return imagenet_utils.preprocess_input(image_batch) / 255.0
+def load_vflow(
+    vflow_path,
+    agl,
+    args,
+    dtype_out="float32",
+    units_per_meter_conversion_factors=UNITS_PER_METER_CONVERSION_FACTORS,
+    return_vflow_pred_mat=False,
+):
 
-def get_batch_inds(idx, batch_sz):
-    N = len(idx)
-    batch_inds = []
-    idx0 = 0
-    to_process = True
-    while to_process:
-        idx1 = idx0 + batch_sz
-        if idx1 > N:
-            idx1 = N
-            idx0 = idx1 - batch_sz
-            to_process = False
-        batch_inds.append(idx[idx0:idx1])
-        idx0 = idx1
-    return batch_inds
+    vflow_path = Path(vflow_path)
+    vflow_data = json.load(vflow_path.open("r"))
+
+    # e.g., (pixels / cm) * (cm / m) = (pixels / m)
+    units_per_meter = units_per_meter_conversion_factors[args.unit]
+    vflow_data["scale"] = vflow_data["scale"] * units_per_meter
+
+    xdir, ydir = np.sin(vflow_data["angle"]), np.cos(vflow_data["angle"])
+    mag = agl * vflow_data["scale"]
+    
+    vflow_items = [mag.astype(dtype_out), xdir.astype(dtype_out), ydir.astype(dtype_out), vflow_data]
+
+    if return_vflow_pred_mat:
+        vflow = np.zeros((agl.shape[0],agl.shape[1],2))
+        vflow[:,:,0] = mag * xdir
+        vflow[:,:,1] = mag * ydir
+        vflow_items.insert(0, vflow)
+
+    return vflow_items
+
+
+def get_r2(error_sum, gt_sq_sum, data_sum, count):
+    return 1 - error_sum / (gt_sq_sum - (data_sum ** 2) / count)
+
+
+def get_rms(errors):
+    return np.sqrt(np.mean(np.square(errors)))
+
+
+def get_angle_error(dir_pred, dir_gt):
+    dir_pred /= np.linalg.norm(dir_pred)
+    dir_gt /= np.linalg.norm(dir_gt)
+    cos_ang = np.dot(dir_pred, dir_gt)
+    sin_ang = np.linalg.norm(np.cross(dir_pred, dir_gt))
+    rad_diff = np.arctan2(sin_ang, cos_ang)
+    angle_error = np.degrees(rad_diff)
+    return angle_error
+
+
+def get_r2_info(data_gt, data_pred):
+
+    data_pred = np.squeeze(data_pred)
+
+    not_nan = ~np.isnan(data_gt)
+    count = np.sum(not_nan)
+    diff = data_pred - data_gt
+
+    error_sum = np.sum(np.square(diff[not_nan]))
+    rms = get_rms(diff[not_nan])
+    data_sum = np.sum(data_gt[not_nan])
+    gt_sq_sum = np.sum(np.square(data_gt[not_nan]))
+
+    return count, error_sum, rms, data_sum, gt_sq_sum
+
+
+def convert_and_compress_prediction_dir(
+    predictions_dir,
+    to_unit="cm",
+    agl_dtype="uint16",
+    compression_type="tiff_adobe_deflate",
+    conversion_factors=UNITS_PER_METER_CONVERSION_FACTORS,
+):
+    """Convert and compress prediction directory.
+    Default parameters are consistent with DrivenData platform submission requirements.
+    """
+    predictions_dir = Path(predictions_dir)
+    converted_predictions_dir = predictions_dir.with_name(
+        f"{predictions_dir.name}_converted_{to_unit}_compressed_{agl_dtype}"
+    )
+    converted_predictions_dir.mkdir(exist_ok=True, parents=True)
+
+    conversion_factor = conversion_factors[to_unit]
+
+    agl_paths = list(predictions_dir.glob("*_AGL.tif"))
+    json_paths = list(
+        pth.with_name(pth.name.replace("_AGL", "_VFLOW")).with_suffix(".json")
+        for pth in agl_paths
+    )
+    for agl_path, json_path in tqdm(zip(agl_paths, json_paths), total=len(agl_paths)):
+        # convert and compress agl tif
+        imarray = np.array(Image.open(agl_path))
+        imarray = np.round(imarray * conversion_factor).astype(agl_dtype)
+        new_image = Image.fromarray(imarray)
+        new_image_path = converted_predictions_dir / agl_path.name
+        new_image.save(str(new_image_path), "TIFF", compression=compression_type)
+
+        # convert and compress vflow json
+        vflow = json.load(json_path.open("r"))
+        vflow["scale"] = vflow["scale"] / conversion_factor
+        new_json_path = converted_predictions_dir / json_path.name
+        json.dump(vflow, new_json_path.open("w"))

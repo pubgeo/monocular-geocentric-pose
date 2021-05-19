@@ -1,280 +1,564 @@
-"""
-Copyright 2020 The Johns Hopkins University Applied Physics Laboratory LLC
-All rights reserved.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
-#Approved for public release, 20-563
-
-import sys
-sys.path.append("..")
-
 import os
 import numpy as np
-from tqdm import tqdm
+import sys
+
 from glob import glob
-from keras.layers import Input
-from keras.models import load_model
-from keras.callbacks import TensorBoard,ModelCheckpoint
+from pathlib import Path
+
+import segmentation_models_pytorch as smp
+import torch
+
+from tqdm import tqdm
+
 import json
 import cv2
-import multiprocessing
 
-from segmentation_models import UnetFlow
-from utilities.misc_utils import get_data,get_batch_inds,load_image,save_image,no_nan_mse,image_preprocess,load_vflow,get_checkpoint_dir
-from utilities.augmentation import augment,rotate_image,rotate_xydir
+from segmentation_models_pytorch.utils.meter import AverageValueMeter
 
-ignore_value = -10000
+from pathlib import Path
+from PIL import Image
+
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset as BaseDataset
+
+from utilities.misc_utils import (
+    UNITS_PER_METER_CONVERSION_FACTORS,
+    convert_and_compress_prediction_dir,
+    load_image,
+    load_vflow,
+    get_rms,
+    get_r2_info,
+    get_angle_error,
+    get_r2,
+    save_image,
+)
+from utilities.augmentation_vflow import augment_vflow
+from utilities.unet_vflow import UnetVFLOW
+
+
+RNG = np.random.RandomState(4321)
+
+
+class Dataset(BaseDataset):
+    def __init__(
+        self,
+        sub_dir,
+        args,
+        rng=RNG,
+    ):
+
+        self.is_test = sub_dir == args.test_sub_dir
+        self.rng = rng
+
+        # create all paths with respect to RGB path ordering to maintain alignment of samples
+        dataset_dir = Path(args.dataset_dir) / sub_dir
+        rgb_paths = list(dataset_dir.glob(f"*_RGB.{args.rgb_suffix}"))
+        if rgb_paths == []: rgb_paths = list(dataset_dir.glob(f"*_RGB*.{args.rgb_suffix}")) # original file names
+        agl_paths = list(
+            pth.with_name(pth.name.replace("_RGB", "_AGL")).with_suffix(".tif")
+            for pth in rgb_paths
+        )
+        vflow_paths = list(
+            pth.with_name(pth.name.replace("_RGB", "_VFLOW")).with_suffix(".json")
+            for pth in rgb_paths
+        )
+
+        if self.is_test:
+            self.paths_list = rgb_paths
+        else:
+            self.paths_list = [
+                (rgb_paths[i], vflow_paths[i], agl_paths[i])
+                for i in range(len(rgb_paths))
+            ]
+
+            self.paths_list = [
+                self.paths_list[ind]
+                for ind in self.rng.permutation(len(self.paths_list))
+            ]
+            if args.sample_size is not None:
+                self.paths_list = self.paths_list[: args.sample_size]
+        self.preprocessing_fn = smp.encoders.get_preprocessing_fn(
+            args.backbone, "imagenet"
+        )
+
+        self.args = args
+        self.sub_dir = sub_dir
+
+    def __getitem__(self, i):
+
+        if self.is_test:
+            rgb_path = self.paths_list[i]
+            image = load_image(rgb_path, self.args)
+        else:
+            rgb_path, vflow_path, agl_path = self.paths_list[i]
+            image = load_image(rgb_path, self.args)
+            agl = load_image(agl_path, self.args)
+            mag, xdir, ydir, vflow_data = load_vflow(vflow_path, agl, self.args)
+            scale = vflow_data["scale"]
+            if self.args.augmentation:
+                image, mag, xdir, ydir, agl, scale = augment_vflow(
+                    image,
+                    mag,
+                    xdir,
+                    ydir,
+                    vflow_data["angle"],
+                    vflow_data["scale"],
+                    agl=agl,
+                )
+            xdir = np.float32(xdir)
+            ydir = np.float32(ydir)
+            mag = mag.astype("float32")
+            agl = agl.astype("float32")
+            scale = np.float32(scale)
+
+            xydir = np.array([xdir, ydir])
+
+        if self.is_test and self.args.downsample > 1:
+            image = cv2.resize(
+                image,
+                (
+                    int(image.shape[0] / self.args.downsample),
+                    int(image.shape[1] / self.args.downsample),
+                ),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
+        image = self.preprocessing_fn(image).astype("float32")
+        image = np.transpose(image, (2, 0, 1))
+
+        if self.is_test:
+            return image, str(rgb_path)
+        else:
+            return image, xydir, agl, mag, scale
+
+    def __len__(self):
+        return len(self.paths_list)
+
+
+class Epoch:
+    def __init__(
+        self,
+        model,
+        args,
+        dense_loss=None,
+        angle_loss=None,
+        scale_loss=None,
+        stage_name=None,
+        device="cpu",
+        verbose=True,
+    ):
+        self.args = args
+        self.model = model
+        self.dense_loss = dense_loss
+        self.angle_loss = angle_loss
+        self.scale_loss = scale_loss
+        self.stage_name = stage_name
+        self.verbose = verbose
+        self.device = device
+
+        self.loss_names = ["combined", "agl", "mag", "angle", "scale"]
+
+        self._to_device()
+
+    def _to_device(self):
+        self.model.to(self.device)
+        if self.stage_name != "valid":
+            self.dense_loss.to(self.device)
+            self.angle_loss.to(self.device)
+            self.scale_loss.to(self.device)
+
+    def _format_logs(self, logs):
+        str_logs = ["{} - {:.4}".format(k, v) for k, v in logs.items()]
+        s = ", ".join(str_logs)
+        return s
+
+    def batch_update(self, x, y):
+        raise NotImplementedError
+
+    def on_epoch_start(self):
+        pass
+
+    def run(self, dataloader):
+
+        self.on_epoch_start()
+
+        logs = {}
+
+        loss_meters = {}
+        for loss_name in self.loss_names:
+            loss_meters[loss_name] = AverageValueMeter()
+
+        if self.stage_name == "valid":
+            agl_count, agl_error_sum, agl_gt_sq_sum, agl_sum = 0, 0, 0, 0
+            mag_count, mag_error_sum, mag_gt_sq_sum, mag_sum = 0, 0, 0, 0
+            angle_errors = []
+            agl_rms = []
+            mag_rms = []
+            scale_errors = []
+
+        with tqdm(
+            dataloader,
+            desc=self.stage_name,
+            file=sys.stdout,
+            disable=not (self.verbose),
+        ) as iterator:
+            for itr_data in iterator:
+                image, xydir, agl, mag, scale = itr_data
+                scale = torch.unsqueeze(scale, 1)
+
+                image = image.to(self.device)
+
+                if self.stage_name != "valid":
+                    xydir, agl, mag, scale = (
+                        xydir.to(self.device),
+                        agl.to(self.device),
+                        mag.to(self.device),
+                        scale.to(self.device),
+                    )
+                    y = [xydir, agl, mag, scale]
+
+                    (
+                        loss,
+                        xydir_pred,
+                        agl_pred,
+                        mag_pred,
+                        scale_pred,
+                    ) = self.batch_update(image, y)
+
+                    loss_logs = {}
+
+                    for name in self.loss_names:
+                        curr_loss = loss[name].cpu().detach().numpy()
+                        if name == "scale":
+                            curr_loss = np.mean(curr_loss)
+                        loss_meters[name].add(curr_loss)
+                        loss_logs[name] = loss_meters[name].mean
+
+                    logs.update(loss_logs)
+                else:
+
+                    xydir_pred, agl_pred, mag_pred, scale_pred = self.batch_update(
+                        image
+                    )
+
+                    xydir = xydir.cpu().detach().numpy()
+                    agl = agl.cpu().detach().numpy()
+                    mag = mag.cpu().detach().numpy()
+                    scale = scale.cpu().detach().numpy()
+
+                    xydir_pred = xydir_pred.cpu().detach().numpy()
+                    agl_pred = agl_pred.cpu().detach().numpy()
+                    mag_pred = mag_pred.cpu().detach().numpy()
+                    scale_pred = scale_pred.cpu().detach().numpy()
+
+                    for batch_ind in range(agl.shape[0]):
+
+                        count, error_sum, rms, data_sum, gt_sq_sum = get_r2_info(
+                            agl[batch_ind, :, :], agl_pred[batch_ind, :, :]
+                        )
+                        agl_count += count
+                        agl_error_sum += error_sum
+                        agl_rms.append(rms)
+                        agl_sum += data_sum
+                        agl_gt_sq_sum += gt_sq_sum
+
+                        count, error_sum, rms, data_sum, gt_sq_sum = get_r2_info(
+                            mag[batch_ind, :, :], mag_pred[batch_ind, :, :]
+                        )
+                        mag_count += count
+                        mag_error_sum += error_sum
+                        mag_rms.append(rms)
+                        mag_sum += data_sum
+                        mag_gt_sq_sum += gt_sq_sum
+
+                        dir_pred = xydir_pred[batch_ind, :]
+                        dir_gt = xydir[batch_ind, :]
+
+                        angle_error = get_angle_error(dir_pred, dir_gt)
+
+                        angle_errors.append(angle_error)
+                        scale_errors.append(
+                            np.abs(scale[batch_ind] - scale_pred[batch_ind])
+                        )
+
+                if self.verbose:
+                    s = self._format_logs(logs)
+                    iterator.set_postfix_str(s)
+
+        if self.stage_name == "valid":
+
+            r2_agl = get_r2(agl_error_sum, agl_gt_sq_sum, agl_sum, agl_count)
+            r2_mag = get_r2(mag_error_sum, mag_gt_sq_sum, mag_sum, mag_count)
+
+            angle_rms = get_rms(angle_errors)
+            scale_rms = get_rms(scale_errors)
+            agl_rms = get_rms(agl_rms)
+            mag_rms = get_rms(mag_rms)
+
+            print(
+                "VAL Angle RMS: %.2f; AGL RMS: %.2f, R^2: %.4f; MAG RMS: %.2f, R^2: %.4f; Scale RMS: %.4f"
+                % (angle_rms, agl_rms, r2_agl, mag_rms, r2_mag, scale_rms)
+            )
+
+        return logs
+
+
+class TrainEpoch(Epoch):
+    def __init__(
+        self,
+        model,
+        args,
+        dense_loss,
+        angle_loss,
+        scale_loss,
+        optimizer,
+        device="cpu",
+        verbose=True,
+    ):
+        super().__init__(
+            model=model,
+            args=args,
+            dense_loss=dense_loss,
+            angle_loss=angle_loss,
+            scale_loss=scale_loss,
+            stage_name="train",
+            device=device,
+            verbose=verbose,
+        )
+        self.optimizer = optimizer
+
+    def on_epoch_start(self):
+        self.model.train()
+
+    def batch_update(self, x, y):
+        self.optimizer.zero_grad()
+        xydir_pred, agl_pred, mag_pred, scale_pred = self.model.forward(x.float())
+
+        scale_pred = torch.unsqueeze(scale_pred, 1)
+
+        xydir, agl, mag, scale = y
+        loss_agl = self.dense_loss(agl_pred, agl)
+        loss_mag = self.dense_loss(mag_pred, mag)
+        loss_angle = self.angle_loss(xydir_pred, xydir)
+
+        loss_scale = self.scale_loss(scale_pred, scale)
+
+        loss_combined = (
+            self.args.agl_weight * loss_agl
+            + self.args.mag_weight * loss_mag
+            + self.args.angle_weight * loss_angle
+            + self.args.scale_weight * loss_scale
+        )
+
+        loss = {
+            "combined": loss_combined,
+            "agl": loss_agl,
+            "mag": loss_mag,
+            "angle": loss_angle,
+            "scale": loss_scale,
+        }
+
+        loss_combined.backward()
+        self.optimizer.step()
+
+        return loss, xydir_pred, agl_pred, mag_pred, scale_pred
+
+
+class ValidEpoch(Epoch):
+    def __init__(self, model, args, device="cpu", verbose=True):
+        super().__init__(
+            model=model,
+            args=args,
+            stage_name="valid",
+            device=device,
+            verbose=verbose,
+        )
+
+    def on_epoch_start(self):
+        self.model.eval()
+
+    def batch_update(self, x):
+        with torch.no_grad():
+            xydir_pred, agl_pred, mag_pred, scale_pred = self.model.forward(x.float())
+
+            scale_pred = torch.unsqueeze(scale_pred, 1)
+
+        return xydir_pred, agl_pred, mag_pred, scale_pred
+
+
+class NoNaNMSE(smp.utils.base.Loss):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        pass
+
+    def forward(self, output, target):
+        diff = torch.squeeze(output) - target
+        not_nan = ~torch.isnan(diff)
+        loss = torch.mean(diff.masked_select(not_nan) ** 2)
+        return loss
+
+
+class MSELoss(smp.utils.base.Loss):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def forward(self, output, target):
+        return torch.nn.MSELoss()(output, target)
+
 
 def train(args):
-    train_data = get_data(args, is_train=True)
-    val_data = get_data(args, is_train=False, rgb_paths_only=True)
-    train_datagen, val_datagen, model = build_model(args, train_data, val_data)
-    
-    checkpoint_dir,_ = get_checkpoint_dir(args)
-    
-    checkpoint_filepath = os.path.join(checkpoint_dir, "weights.{epoch:02d}.hdf5")
-    checkpoint = ModelCheckpoint(filepath=checkpoint_filepath, monitor="loss", verbose=0, save_best_only=False,
-                                 save_weights_only=False, mode="auto", period=args.save_period)
-    
-    tensorboard = TensorBoard(log_dir=args.tensorboard_dir, write_graph=False)
-    
-    callbacks_list = [checkpoint, tensorboard]
-    
-    model.fit_generator(generator=train_datagen,
-                        steps_per_epoch=(len(train_data) / args.batch_size + 1),
-                        epochs=args.num_epochs, 
-                        callbacks=callbacks_list)
-    
+
+    torch.backends.cudnn.benchmark = True
+
+    model = build_model(args)
+
+    train_dataset = Dataset(sub_dir=args.train_sub_dir, args=args)
+    val_dataset = Dataset(sub_dir=args.valid_sub_dir, args=args)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+
+    optimizer = torch.optim.Adam(
+        [
+            dict(params=model.parameters(), lr=args.learning_rate),
+        ]
+    )
+
+    dense_loss = NoNaNMSE()
+    angle_loss = MSELoss()
+    scale_loss = MSELoss()
+
+    train_epoch = TrainEpoch(
+        model,
+        args=args,
+        dense_loss=dense_loss,
+        angle_loss=angle_loss,
+        scale_loss=scale_loss,
+        optimizer=optimizer,
+        device="cuda",
+    )
+
+    val_epoch = ValidEpoch(
+        model,
+        args=args,
+        device="cuda",
+    )
+
+    for i in range(args.num_epochs):
+
+        print("\nEpoch: {}".format(i))
+        train_logs = train_epoch.run(train_loader)
+
+        if args.val_period > 0 and ((i + 1) % args.val_period) == 0:
+            valid_logs = val_epoch.run(val_loader)
+
+        if ((i + 1) % args.save_period) == 0:
+            torch.save(
+                model.state_dict(),
+                os.path.join(args.checkpoint_dir, "./model_%d.pth" % i),
+            )
+
+        # save best epoch
+        if args.save_best:
+            combined_loss = train_logs["combined"]
+            if i == 0:
+                best_loss = combined_loss
+            if combined_loss <= best_loss:
+                torch.save(
+                    model.state_dict(),
+                    os.path.join(args.checkpoint_dir, "./model_best.pth"),
+                )
+
+
 def test(args):
-    rgb_paths = get_data(args, is_train=False, rgb_paths_only=True)
-    
-    sub_dir = None
-    if args.test_model_file is not None:
-        weights_path = args.test_model_file
+
+    torch.backends.cudnn.benchmark = True
+
+    if args.model_path is None:
+        model_paths = glob(os.path.join(args.checkpoint_dir, "*.pth"))
+        nums = [int(path.split("_")[-1].replace(".pth", "")) for path in model_paths]
+        idx = np.argsort(nums)[::-1]
+        model_path = model_paths[idx[0]]
     else:
-        checkpoint_dir,sub_dir = get_checkpoint_dir(args)
-        weights_paths = glob(os.path.join(checkpoint_dir, "*.hdf5"))
-        nums = [np.int(path.split(".")[-2]) for path in weights_paths]
-        weights_path = weights_paths[np.argsort(nums)[-1]]
-        
-    model = load_model(weights_path, compile=False)
-    
-    predictions_dir = args.predictions_dir if sub_dir is None else os.path.join(args.predictions_dir, sub_dir)
-    if not os.path.isdir(predictions_dir):
-        os.makedirs(predictions_dir)
-       
-    
-    angles = [angle for angle in range(0,360,36)] if args.test_rotations else [0]
-    
-    for rgb_path in tqdm(rgb_paths):
-        basename = os.path.basename(rgb_path).replace("_RGB_", "_").replace(".tif", "")
-        image = load_image(rgb_path)
-        
-        for angle in angles:
-            
-            out_dir_path = os.path.join(predictions_dir, basename + "_angle_%d_DIRPRED.json" % angle)
-            out_mag_path = os.path.join(predictions_dir, basename + "_angle_%d_MAGPRED.tif" % angle)
-            out_agl_path = os.path.join(predictions_dir, basename + "_angle_%d_AGLPRED.tif" % angle)
-            
-            image_rotated = rotate_image(np.copy(image), None, None, angle, image_only=True)
-            image_rotated = image_preprocess(image_rotated)
-            pred = model.predict(np.expand_dims(image_rotated, axis=0))
-            agl = None
-            
-            if len(pred)==2:
-                xydir,mag = pred
-            else:
-                xydir,mag,agl = pred
+        model_path = args.model_path
 
-            xydir = xydir[0,:].tolist()
-            mag = mag[0,:,:,0]
+    model = build_model(args)
+    checkpoint = torch.load(model_path)
+    model.load_state_dict(checkpoint)
+    model.to("cuda")
+    model.eval()
+    with torch.no_grad():
 
-            json.dump(xydir, open(out_dir_path, "w"))
-            save_image(mag, out_mag_path)
-            if agl is not None:
-                agl = agl[0,:,:,0]
-                save_image(agl, out_agl_path)
-                
-    
-def get_current_metrics(item):
-    vflow_gt_path,agl_gt_path,dirpred_path,magpred_path,aglpred_path, angle = item
-    dir_pred = json.load(open(dirpred_path, "r"))
-    mag_pred = load_image(magpred_path)
-    agl_pred = None if not os.path.isfile(aglpred_path) else load_image(aglpred_path)
+        test_dataset = Dataset(sub_dir=args.test_sub_dir, args=args)
+        test_loader = DataLoader(
+            test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=1
+        )
+        predictions_dir = Path(args.predictions_dir)
+        for images, rgb_paths in tqdm(test_loader):
 
-    agl_gt = load_image(agl_gt_path)
-    
-    vflow_gt,mag_gt,xdir_gt,ydir_gt,_ = load_vflow(vflow_gt_path, agl_gt)
-    
-    if angle != 0:
-        _,mag_gt,agl_gt = rotate_image(None, mag_gt, agl_gt, angle, image_only=False)
-        xdir_gt,ydir_gt = rotate_xydir(xdir_gt, ydir_gt, angle)
+            images = images.float().to("cuda")
+            pred = model(images)
 
-    dir_gt = np.array([xdir_gt,ydir_gt])
-    dir_gt /= np.linalg.norm(dir_gt)
-    
-    
-    vflow_gt = cv2.merge((mag_gt*dir_gt[0], mag_gt*dir_gt[1]))
+            numpy_preds = []
+            for i in range(len(pred)):
+                numpy_preds.append(pred[i].detach().cpu().numpy())
 
-    dir_pred /= np.linalg.norm(dir_pred)
+            xydir_pred, agl_pred, mag_pred, scale_pred = numpy_preds
 
-    cos_ang = np.dot(dir_pred, dir_gt)
-    sin_ang = np.linalg.norm(np.cross(dir_pred,dir_gt))
-    rad_diff = np.arctan2(sin_ang, cos_ang)
-    angle_error = np.degrees(rad_diff)
+            if scale_pred.ndim == 0:
+                scale_pred = np.expand_dims(scale_pred, axis=0)
 
-    vflow_pred = cv2.merge((mag_pred*dir_pred[0], mag_pred*dir_pred[1]))
+            for batch_ind in range(agl_pred.shape[0]):
+                # vflow pred
+                angle = np.arctan2(xydir_pred[batch_ind][0], xydir_pred[batch_ind][1])
+                vflow_data = {
+                    "scale": np.float64(
+                        scale_pred[batch_ind] * args.downsample
+                    ),  # upsample
+                    "angle": np.float64(angle),
+                }
 
-    mag_error = np.nanmean(np.abs(mag_pred-mag_gt))
-    epe = np.nanmean(np.sqrt(np.sum(np.square(vflow_gt-vflow_pred), axis=2)))
-    agl_error = None if agl_pred is None else np.nanmean(np.abs(agl_pred-agl_gt))
-    
-    return angle_error,mag_error,epe,agl_error
-    
-def metrics(args):
-    predictions_dir = args.predictions_dir 
-    
-    _,sub_dir = get_checkpoint_dir(args)
-    
-    dirpred_paths = glob(os.path.join(predictions_dir, sub_dir, "*_DIRPRED.json"))
-    
-    angle_error, mag_error, epe, agl_error = [],[],[],[]
-    
-    items = []
-    for dirpred_path in tqdm(dirpred_paths):
-        magpred_path = dirpred_path.replace("_DIRPRED.json", "_MAGPRED.tif")
-        aglpred_path = dirpred_path.replace("_DIRPRED.json", "_AGLPRED.tif")
-        
-        basename = os.path.basename(magpred_path)
-        underscores = [ind for ind,val in enumerate(basename) if val=="_"]
-        
-        angle = np.int(basename.split("_")[-2])
-        
-        if not args.test_rotations and angle != 0:
-            continue
-        
-        vflow_name = basename[:underscores[2]] + "_VFLOW" + basename[underscores[2]:underscores[3]] + ".json"
-        agl_name = vflow_name.replace("_VFLOW_", "_AGL_").replace(".json", ".tif")
-        vflow_gt_path = os.path.join(args.dataset_dir, "test", vflow_name)
-        agl_gt_path = os.path.join(args.dataset_dir, "test", agl_name)
-        
-        items.append((vflow_gt_path,agl_gt_path,dirpred_path,magpred_path,aglpred_path,angle))
-        
-    if args.multiprocessing:
-        pool = multiprocessing.Pool()
-        results = list(tqdm(pool.imap_unordered(get_current_metrics, items), total=len(items)))
-        pool.close()
-        pool.join()
-    else:
-        results = [get_current_metrics(item) for item in tqdm(items)]
-        
-    for result in results:
-        curr_angle_error,curr_mag_error,curr_epe,curr_agl_error = result
-        angle_error.append(curr_angle_error)
-        mag_error.append(curr_mag_error)
-        epe.append(curr_epe)
-        if curr_agl_error is not None:
-            agl_error.append(curr_agl_error)
-        
-    mean_angle_error = np.nanmean(angle_error)
-    mean_mag_error = np.nanmean(mag_error)
-    mean_epe = np.nanmean(epe)
-    if len(agl_error) > 0:
-        mean_agl_error = np.nanmean(agl_error)
+                # agl pred
+                curr_agl_pred = agl_pred[batch_ind, 0, :, :]
+                curr_agl_pred[curr_agl_pred < 0] = 0
+                agl_resized = cv2.resize(
+                    curr_agl_pred,
+                    (
+                        curr_agl_pred.shape[0] * args.downsample,  # upsample
+                        curr_agl_pred.shape[1] * args.downsample,  # upsample
+                    ),
+                    interpolation=cv2.INTER_NEAREST,
+                )
 
-    fid = open(os.path.join(args.predictions_dir, "metrics_" + sub_dir + ".txt"), "w")
-    fid.write("Angle error: %f" % mean_angle_error)
-    fid.write("Mag error: %f" % mean_mag_error)
-    fid.write("EPE: %f" % mean_epe)
-    if len(agl_error) > 0:
-        fid.write("AGL error: %f" % mean_agl_error)
-    fid.close()
+                # save
+                rgb_path = predictions_dir / Path(rgb_paths[batch_ind]).name
+                agl_path = rgb_path.with_name(
+                    rgb_path.name.replace("_RGB", "_AGL")
+                ).with_suffix(".tif")
+                vflow_path = rgb_path.with_name(
+                    rgb_path.name.replace("_RGB", "_VFLOW")
+                ).with_suffix(".json")
 
-    print("Angle error: %f" % mean_angle_error)
-    print("Mag error: %f" % mean_mag_error)
-    print("EPE: %f" % mean_epe)
-    if len(agl_error) > 0:
-        print("AGL error: %f" % mean_agl_error)
-        
+                json.dump(vflow_data, vflow_path.open("w"))
+                save_image(agl_path, agl_resized)  # save_image assumes units of meters
 
-def image_generator(data, args):
-    idx = np.random.permutation(len(data))
-    while True:
-        batch_inds = get_batch_inds(idx, args.batch_size)
-        for inds in batch_inds:
-            img_batch,label_batch = load_batch(inds, data, args)
-            yield (img_batch, label_batch)
-    
-def load_batch(inds, data, args):
-    
-    xydir_batch = np.zeros((len(inds), 2))
-    mag_batch = np.zeros((len(inds), args.image_size[0], args.image_size[1], 1))
-    image_batch = np.zeros((len(inds), args.image_size[0], args.image_size[1], 3))
-    if args.add_height:
-        agl_batch = np.zeros((len(inds), args.image_size[0], args.image_size[1], 1))
+    # creates new dir predictions_dir_con
+    if args.convert_predictions_to_cm_and_compress:
+        convert_and_compress_prediction_dir(predictions_dir=predictions_dir)
 
-    for batch_ind,ind in enumerate(inds):
 
-        rgb_path,vflow_path,agl_path = data[ind]
-
-        image = load_image(rgb_path)
-        agl = load_image(agl_path)
-        vflow,mag,xdir,ydir,angle_orig = load_vflow(vflow_path, agl)
-
-        if args.augmentation:
-            image,mag,xdir,ydir,agl = augment(image, mag, xdir, ydir, agl=agl)
-
-        xydir_batch[batch_ind,0] = xdir
-        xydir_batch[batch_ind,1] = ydir
-          
-        image_batch[batch_ind,:,:,:] = image
-        mag_batch[batch_ind,:,:,0] = mag
-        if args.add_height:
-            agl_batch[batch_ind,:,:,0] = agl
-            
-    mag_batch[np.isnan(mag_batch)] = ignore_value 
-    gt_batch = {"xydir":xydir_batch, "mag":mag_batch}
-    if args.add_height:
-        agl_batch[np.isnan(agl_batch)] = ignore_value
-        gt_batch["agl"] = agl_batch
-        
-    image_batch = image_preprocess(image_batch)
-    
-    return image_batch, gt_batch
-
-def build_model(args, train_data, val_data):
-        
-    train_datagen = image_generator(train_data, args)
-    val_datagen = image_generator(val_data, args)
-
-    input_tensor = Input(shape=(args.image_size[0], args.image_size[1], 3))
-    input_shape = (args.image_size[0], args.image_size[1], 3)
-    
-    model = UnetFlow(input_shape=input_shape, input_tensor=input_tensor, 
-                        backbone_name=args.backbone, encoder_weights="imagenet", add_height=args.add_height)
-    
-    if args.continue_training_file is not None:
-        model.load_weights(args.continue_training_file)
-
-    loss = {"xydir":"mse", "mag":no_nan_mse}
-    loss_weights = {"xydir": 1.0, "mag":1.0}
-    if args.add_height:
-        loss["agl"] = no_nan_mse
-        loss_weights["agl"] = 1.0
-        
-    model.compile("Adam", loss=loss, loss_weights=loss_weights)
-        
-    return train_datagen, val_datagen, model
-
+def build_model(args):
+    model = UnetVFLOW(args.backbone, encoder_weights="imagenet")
+    return model
