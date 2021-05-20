@@ -19,7 +19,7 @@ def downsample_images(args, downsample=2):
 
         # load
         agl_path = rgb_path.with_name(
-            rgb_path.name.replace("_RGB", "_AG.")
+            rgb_path.name.replace("_RGB", "_AGL")
         ).with_suffix(".tif")
         vflow_path = rgb_path.with_name(
             rgb_path.name.replace("_RGB", "_VFLOW")
