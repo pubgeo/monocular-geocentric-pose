@@ -28,13 +28,13 @@ If you use our dataset or code, please cite [our CVPR EarthVision 2021 paper](ht
 
 ## Competition
 
-We developed an upcoming competition in collaboration with [DrivenData](https://www.drivendata.org/). Developers from DrivenData contributed software improvements for reducing file sizes and run times for submission evaluation and documentation below for working with the competition data.
+We developed the [Overhead Geopose Challenge](https://www.drivendata.org/competitions/78/overhead-geopose-challenge/) in collaboration with DrivenData for the National Geospatial Intelligence Agency (NGA). Developers from DrivenData contributed software improvements for reducing file sizes and run times for submission evaluation and documentation below for working with the competition data. They also produced a [blog post](https://www.drivendata.co/blog/overhead-geopose-benchmark/) with a tutorial describing how to use our code as a benchmark for the contest.
 
 ## Data
 
 The original Urban Semantic 3D (US3D) data used in our CVPR 2020 paper is available on [DataPort](https://ieee-dataport.org/open-access/urban-semantic-3d-dataset).
 
-Competition data associated with our CVPR EarthVision 2021 paper will be made available soon. The original data includes RGB images in TIFF format and above ground level (AGL) height images in floating point TIFF format with units of meters. To reduce file sizes, the competition RGB images are J2K, and the AGL images are integer TIFF format with units of centimeters.
+Competition data associated with our CVPR EarthVision 2021 paper is available for download at the [Overhead Geopose Challenge](https://www.drivendata.org/competitions/78/overhead-geopose-challenge/) web site and will be archived in the US3D DataPort repository when the contest is complete. The original data includes RGB images in TIFF format and above ground level (AGL) height images in floating point TIFF format with units of meters. To reduce file sizes, the competition RGB images are J2K, and the AGL images are integer TIFF format with units of centimeters.
 
 ## Dependencies
 
