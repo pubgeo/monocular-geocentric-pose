@@ -39,7 +39,6 @@ def load_image(
     dtype_out="float32",
     units_per_meter_conversion_factors=UNITS_PER_METER_CONVERSION_FACTORS,
 ):
-
     image_path = Path(image_path)
     if not image_path.exists():
         return None
@@ -72,6 +71,9 @@ def load_vflow(
 
     vflow_path = Path(vflow_path)
     vflow_data = json.load(vflow_path.open("r"))
+    
+    if np.isnan(vflow_data["scale"]): return None
+    if np.isnan(vflow_data["angle"]): return None
 
     # e.g., (pixels / cm) * (cm / m) = (pixels / m)
     units_per_meter = units_per_meter_conversion_factors[args.unit]
