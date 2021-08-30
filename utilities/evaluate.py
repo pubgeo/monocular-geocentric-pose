@@ -72,8 +72,10 @@ def write_rectified_images(rgb, mag, angle_rads, agl, output_rgb_path):
     rgb_rct[mask_rct > 0, 0] = 135
     rgb_rct[mask_rct > 0, 1] = 206
     rgb_rct[mask_rct > 0, 2] = 250
+    output_rgb_path = output_rgb_path.replace(".j2k", ".tif")
     save_image(output_rgb_path, rgb)
-    save_image(output_rgb_path.replace(".tif", "_RECT.tif"), rgb_rct)
+    output_rect_path = output_rgb_path.replace(".tif", "_RECT.tif")
+    save_image(output_rect_path, rgb_rct)
     # AGL with rectification
     rgb_rct[:, :, 0] = agl_rct
     rgb_rct[:, :, 1] = agl_rct
@@ -81,9 +83,8 @@ def write_rectified_images(rgb, mag, angle_rads, agl, output_rgb_path):
     rgb_rct[mask_rct > 0, 0] = 135
     rgb_rct[mask_rct > 0, 1] = 206
     rgb_rct[mask_rct > 0, 2] = 250
-    save_image(
-        output_rgb_path.replace("RGB", "AGL").replace(".tif", "_RECT.tif"), rgb_rct
-    )
+    output_rect_path = output_rgb_path.replace("_RGB", "_AGL").replace(".tif", "_RECT.tif")
+    save_image(output_rect_path, rgb_rct)
     # AGL without rectification
     agl_norect = np.copy(agl)
     agl_norect[agl_norect > max_agl] = max_agl
@@ -191,6 +192,10 @@ def get_city_scores(args, site):
 
     # build lists of images to process
     vflow_gt_paths = glob(os.path.join(args.truth_dir, site + "*_VFLOW*.json"))
+    
+    print(vflow_gt_paths)
+    print(' ')
+
     if vflow_gt_paths == []:
         return np.nan
     angle_error, scale_error, mag_error, epe, agl_error, mag_rms, epe_rms, agl_rms = (
@@ -365,6 +370,8 @@ def get_city_scores(args, site):
 
 
 def evaluate(args):
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
     # get scores for each city and average them
     score_arg = get_city_scores(args, "ARG")
     score_jax = get_city_scores(args, "JAX")
@@ -377,7 +384,6 @@ def evaluate(args):
     print("ATL R-square: ", score_atl)
     print("FINAL R-square: ", final_score)
     if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
         fid = open(os.path.join(args.output_dir, "metrics.txt"), "a+")
         fid.write("\n\nFINAL R-square: %f\n" % final_score)
         fid.close()
