@@ -34,7 +34,7 @@ We developed the [Overhead Geopose Challenge](https://www.drivendata.org/competi
 
 The original Urban Semantic 3D (US3D) data used in our CVPR 2020 paper is available on [DataPort](https://ieee-dataport.org/open-access/urban-semantic-3d-dataset).
 
-Competition data associated with our CVPR EarthVision 2021 paper is available for download at the [Overhead Geopose Challenge](https://www.drivendata.org/competitions/78/overhead-geopose-challenge/) web site and will be archived in the US3D DataPort repository when the contest is complete. The original data includes RGB images in TIFF format and above ground level (AGL) height images in floating point TIFF format with units of meters. To reduce file sizes, the competition RGB images are J2K, and the AGL images are integer TIFF format with units of centimeters.
+Competition data associated with our CVPR EarthVision 2021 paper is available for download at the [Overhead Geopose Challenge](https://www.drivendata.org/competitions/78/overhead-geopose-challenge/) web site and will be archived in the US3D DataPort repository when the contest is complete. The original data includes RGB images in TIFF format and above ground level (AGL) height images in floating point TIFF format with units of meters. To reduce file sizes, the competition RGB images are J2K, and the AGL images are integer TIFF format with units of centimeters. The competition data is now also available on is available on [DataPort](https://ieee-dataport.org/open-access/urban-semantic-3d-dataset).
 
 ## Dependencies
 
