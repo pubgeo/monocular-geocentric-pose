@@ -28,7 +28,7 @@ If you use our dataset or code, please cite [our CVPR EarthVision 2021 paper](ht
 
 ## Competition
 
-We developed the [Overhead Geopose Challenge](https://www.drivendata.org/competitions/78/overhead-geopose-challenge/) in collaboration with DrivenData for the National Geospatial Intelligence Agency (NGA). Developers from DrivenData contributed software improvements for reducing file sizes and run times for submission evaluation and documentation below for working with the competition data. They also produced a [blog post](https://www.drivendata.co/blog/overhead-geopose-benchmark/) with a tutorial describing how to use our code as a benchmark for the contest.
+We developed the [Overhead Geopose Challenge](https://www.drivendata.org/competitions/78/overhead-geopose-challenge/) in collaboration with DrivenData for the National Geospatial Intelligence Agency (NGA). Developers from DrivenData contributed software improvements for reducing file sizes and run times for submission evaluation and documentation below for working with the competition data. They produced a [blog post](https://www.drivendata.co/blog/overhead-geopose-benchmark/) with a tutorial describing how to use our code as a benchmark for the contest. Winning solutions from the competition are provided in this DrivenData [open source repository](https://github.com/drivendataorg/overhead-geopose-challenge), and model weights are archived on [DataPort](https://ieee-dataport.org/open-access/urban-semantic-3d-dataset).
 
 ## Data
 
